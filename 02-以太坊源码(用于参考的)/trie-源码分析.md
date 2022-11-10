@@ -222,43 +222,57 @@ node的结构，可以看到node分为4种类型， fullNode对应了黄皮书�
 		valueNode []byte
 	)
 
-trie的结构， root包含了当前的root节点， db是后端的KV存储，trie的结构最终都是需要通过KV的形式存储到数据库里面去，然后启动的时候是需要从数据库里面加载的。 originalRoot 启动加载的时候的hash值，通过这个hash值可以在数据库里面恢复出整颗的trie树。cachegen字段指示了当前Trie树的cache时代，每次调用Commit操作的时候，会增加Trie树的cache时代。 cache时代会被附加在node节点上面，如果当前的cache时代 - cachelimit参数 大于node的cache时代，那么node会从cache里面卸载，以便节约内存。 其实这就是缓存更新的LRU算法， 如果一个缓存在多久没有被使用，那么就从缓存里面移除，以节约内存空间。
+trie的结构， root包含了当前的root节点，，trie的结构最终都是需要通过KV的形式存储到数据库里面去，然后启动的时候是需要从数据库里面加载的。 owner 启动加载的时候的hash值，unhashed 跟踪数量的叶子已插入自上次散列操作。这个数字将不会直接映射到的数量实际处理节点。 tracer 跟踪每次树结构的变化,提交后将被从置
 
-	// Trie is a Merkle Patricia Trie.
-	// The zero value is an empty trie with no database.
-	// Use New to create a trie that sits on top of a database.
-	//
-	// Trie is not safe for concurrent use.
-	type Trie struct {
-		root         node
-		db           Database
-		originalRoot common.Hash
-	
-		// Cache generation values.
-		// cachegen increases by one with each commit operation.
-		// new nodes are tagged with the current generation and unloaded
-		// when their generation is older than than cachegen-cachelimit.
-		cachegen, cachelimit uint16
-	}
+```
+// Trie is a Merkle Patricia Trie. Use New to create a trie that sits on
+// top of a database. Whenever trie performs a commit operation, the generated
+// nodes will be gathered and returned in a set. Once the trie is committed,
+// it's not usable anymore. Callers have to re-create the trie with new root
+// based on the updated trie database.
+//
+// Trie is not safe for concurrent use.
+type Trie struct {
+	root  node
+	owner common.Hash
 
+	// Keep track of the number leaves which have been inserted since the last
+	// hashing operation. This number will not directly map to the number of
+	// actually unhashed nodes.
+	unhashed int
+
+	// reader is the handler trie can retrieve nodes from.
+	reader *trieReader
+
+	// tracer is the tool to track the trie changes.
+	// It will be reset after each commit operation.
+	tracer *tracer
+}
+```
 
 ###Trie树的插入，查找和删除
-Trie树的初始化调用New函数，函数接受一个hash值和一个Database参数，如果hash值不是空值的化，就说明是从数据库加载一个已经存在的Trie树， 就调用trei.resolveHash方法来加载整颗Trie树，这个方法后续会介绍。 如果root是空，那么就新建一颗Trie树返回。
-
-	func New(root common.Hash, db Database) (*Trie, error) {
-		trie := &Trie{db: db, originalRoot: root}
-		if (root != common.Hash{}) && root != emptyRoot {
-			if db == nil {
-				panic("trie.New: cannot use existing root without a database")
-			}
-			rootnode, err := trie.resolveHash(root[:], nil)
-			if err != nil {
-				return nil, err
-			}
-			trie.root = rootnode
-		}
-		return trie, nil
+Trie树的初始化调用New函数，函数接受一个hash值和一个trieReader参数，如果hash值不是空值的化，就说明是从数据库加载一个已经存在的Trie树， 就调用treiresolveAndTrack方法来加载整颗Trie树，这个方法后续会介绍。 如果root是空，那么就新建一颗Trie树返回。
+```
+func New(id *ID, db NodeReader) (*Trie, error) {
+	reader, err := newTrieReader(id.StateRoot, id.Owner, db)
+	if err != nil {
+		return nil, err
 	}
+	trie := &Trie{
+		owner:  id.Owner,
+		reader: reader,
+		//tracer: newTracer(),
+	}
+	if id.Root != (common.Hash{}) && id.Root != emptyRoot {
+		rootnode, err := trie.resolveAndTrack(id.Root[:], nil)
+		if err != nil {
+			return nil, err
+		}
+		trie.root = rootnode
+	}
+	return trie, nil
+}
+```
 
 Trie树的插入，这是一个递归调用的方法，从根节点开始，一直往下找，直到找到可以插入的点，进行插入操作。参数node是当前插入的节点， prefix是当前已经处理完的部分key， key是还没有处理玩的部分key,  完整的key = prefix + key。 value是需要插入的值。 返回值bool是操作是否改变了Trie树(dirty)，node是插入完成后的子树的根节点， error是错误信息。
 
@@ -404,38 +418,53 @@ Trie树的使用方法在trie_test.go里面有比较详细的参考。 这里我
 
 下面我们来分析下Commit()的主要流程。 经过一系列的调用，最终调用了hasher.go的hash方法。
 
-	func (t *Trie) Commit() (root common.Hash, err error) {
-		if t.db == nil {
-			panic("Commit called on trie with nil database")
-		}
-		return t.CommitTo(t.db)
-	}
-	// CommitTo writes all nodes to the given database.
-	// Nodes are stored with their sha3 hash as the key.
-	//
-	// Committing flushes nodes from memory. Subsequent Get calls will
-	// load nodes from the trie's database. Calling code must ensure that
-	// the changes made to db are written back to the trie's attached
-	// database before using the trie.
-	func (t *Trie) CommitTo(db DatabaseWriter) (root common.Hash, err error) {
-		hash, cached, err := t.hashRoot(db)
-		if err != nil {
-			return (common.Hash{}), err
-		}
-		t.root = cached
-		t.cachegen++
-		return common.BytesToHash(hash.(hashNode)), nil
-	}
-	
-	func (t *Trie) hashRoot(db DatabaseWriter) (node, node, error) {
-		if t.root == nil {
-			return hashNode(emptyRoot.Bytes()), nil, nil
-		}
-		h := newHasher(t.cachegen, t.cachelimit)
-		defer returnHasherToPool(h)
-		return h.hash(t.root, db, true)
-	}
+```
+// Commit collects all dirty nodes in the trie and replaces them with the
+// corresponding node hash. All collected nodes (including dirty leaves if
+// collectLeaf is true) will be encapsulated into a nodeset for return.
+// The returned nodeset can be nil if the trie is clean (nothing to commit).
+// Once the trie is committed, it's not usable anymore. A new trie must
+// be created with new root and updated trie database for following usage
+func (t *Trie) Commit(collectLeaf bool) (common.Hash, *NodeSet, error) {
+	defer t.tracer.reset()
 
+	if t.root == nil {
+		return emptyRoot, nil, nil
+	}
+	// Derive the hash for all dirty nodes first. We hold the assumption
+	// in the following procedure that all nodes are hashed.
+	rootHash := t.Hash()
+
+	// Do a quick check if we really need to commit. This can happen e.g.
+	// if we load a trie for reading storage values, but don't write to it.
+	if hashedNode, dirty := t.root.cache(); !dirty {
+		// Replace the root node with the origin hash in order to
+		// ensure all resolved nodes are dropped after the commit.
+		t.root = hashedNode
+		return rootHash, nil, nil
+	}
+	h := newCommitter(t.owner, t.tracer, collectLeaf)
+	newRoot, nodes, err := h.Commit(t.root)
+	if err != nil {
+		return common.Hash{}, nil, err
+	}
+	t.root = newRoot
+	return rootHash, nodes, nil
+}
+
+// hashRoot calculates the root hash of the given trie
+func (t *Trie) hashRoot() (node, node, error) {
+	if t.root == nil {
+		return hashNode(emptyRoot.Bytes()), nil, nil
+	}
+	// If the number of changes is below 100, we let one thread handle it
+	h := newHasher(t.unhashed >= 100)
+	defer returnHasherToPool(h)
+	hashed, cached := h.hash(t.root, true)
+	t.unhashed = 0
+	return hashed, cached, nil
+}
+```
 
 下面我们简单介绍下hash方法，hash方法主要做了两个操作。 一个是保留原有的树形结构，并用cache变量中， 另一个是计算原有树形结构的hash并把hash值存放到cache变量中保存下来。
 
@@ -890,7 +919,7 @@ VerifyProof方法，接收一个rootHash参数，key参数，和proof数组， �
 	}
 
 
-### security_trie.go 加密的Trie
+### secure_trie.go 加密的Trie
 为了避免刻意使用很长的key导致访问时间的增加， security_trie包装了一下trie树， 所有的key都转换成keccak256算法计算的hash值。同时在数据库里面存储hash值对应的原始的key。
 
 	type SecureTrie struct {
@@ -901,16 +930,20 @@ VerifyProof方法，接收一个rootHash参数，key参数，和proof数组， �
 		secKeyCacheOwner *SecureTrie // Pointer to self, replace the key cache on mismatch
 	}
 
-	func NewSecure(root common.Hash, db Database, cachelimit uint16) (*SecureTrie, error) {
+	// NewStateTrie creates a trie with an existing root node from a backing database.
+	//
+	// If root is the zero hash or the sha3 hash of an empty string, the
+	// trie is initially empty. Otherwise, New will panic if db is nil
+	// and returns MissingNodeError if the root node cannot be found.
+	func NewStateTrie(id *ID, db *Database) (*StateTrie, error) {
 		if db == nil {
-			panic("NewSecure called with nil database")
+			panic("trie.NewStateTrie called without a database")
 		}
-		trie, err := New(root, db)
+		trie, err := New(id, db)
 		if err != nil {
 			return nil, err
 		}
-		trie.SetCacheLimit(cachelimit)
-		return &SecureTrie{trie: *trie}, nil
+		return &StateTrie{trie: *trie, preimages: db.preimages}, nil
 	}
 	
 	// Get returns the value for key stored in the trie.
@@ -923,20 +956,36 @@ VerifyProof方法，接收一个rootHash参数，key参数，和proof数组， �
 		return res
 	}
 	
-	// TryGet returns the value for key stored in the trie.
-	// The value bytes must not be modified by the caller.
-	// If a node was not found in the database, a MissingNodeError is returned.
-	func (t *SecureTrie) TryGet(key []byte) ([]byte, error) {
-		return t.trie.TryGet(t.hashKey(key))
-	}
-	func (t *SecureTrie) CommitTo(db DatabaseWriter) (root common.Hash, err error) {
-		if len(t.getSecKeyCache()) > 0 {
-			for hk, key := range t.secKeyCache {
-				if err := db.Put(t.secKey([]byte(hk)), key); err != nil {
-					return common.Hash{}, err
-				}
-			}
-			t.secKeyCache = make(map[string][]byte)
+	/// Commit collects all dirty nodes in the trie and replaces them with the
+	// corresponding node hash. All collected nodes (including dirty leaves if
+	// collectLeaf is true) will be encapsulated into a nodeset for return.
+	// The returned nodeset can be nil if the trie is clean (nothing to commit).
+	// Once the trie is committed, it's not usable anymore. A new trie must
+	// be created with new root and updated trie database for following usage
+	func (t *Trie) Commit(collectLeaf bool) (common.Hash, *NodeSet, error) {
+		defer t.tracer.reset()
+
+		if t.root == nil {
+			return emptyRoot, nil, nil
 		}
-		return t.trie.CommitTo(db)
+		// Derive the hash for all dirty nodes first. We hold the assumption
+		// in the following procedure that all nodes are hashed.
+		rootHash := t.Hash()
+
+		// Do a quick check if we really need to commit. This can happen e.g.
+		// if we load a trie for reading storage values, but don't write to it.
+		if hashedNode, dirty := t.root.cache(); !dirty {
+			// Replace the root node with the origin hash in order to
+			// ensure all resolved nodes are dropped after the commit.
+			t.root = hashedNode
+			return rootHash, nil, nil
+		}
+		h := newCommitter(t.owner, t.tracer, collectLeaf)
+		newRoot, nodes, err := h.Commit(t.root)
+		if err != nil {
+			return common.Hash{}, nil, err
+		}
+		t.root = newRoot
+		return rootHash, nodes, nil
 	}
+
