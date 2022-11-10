@@ -82,6 +82,14 @@ RLP的源码不是很多， 主要分了三个文件
 
 我们首先看看核心数据结构
 
+	type typeCache struct {
+	 cur atomic.Value
+	 
+	 // This lock synchronizes writers.
+	 mu   sync.Mutex
+	 next map[typekey]*typeinfo
+     }
+
 	var (
 		typeCacheMutex sync.RWMutex                  //读写锁，用来在多线程的时候保护typeCache这个Map
 		typeCache      = make(map[typekey]*typeinfo) //核心数据结构，保存了类型->编解码器函数
@@ -265,27 +273,23 @@ structFields函数遍历所有的字段，然后针对每一个字段调用cache
 
 然后定义了一个最重要的方法， 大部分的EncodeRLP方法都是直接调用了这个方法Encode方法。这个方法首先获取了一个encbuf对象。 然后调用这个对象的encode方法。encode方法中，首先获取了对象的反射类型，根据反射类型获取它的编码器，然后调用编码器的writer方法。 这个就跟上面谈到的typecache联系到一起了。
 	
+	// Encode writes the RLP encoding of val to w. Note that Encode may
+	// perform many small writes in some cases. Consider making w
+	// buffered.
+	//
+	// Please see package-level documentation of encoding rules.
 	func Encode(w io.Writer, val interface{}) error {
-		if outer, ok := w.(*encbuf); ok {
-			// Encode was called by some type's EncodeRLP.
-			// Avoid copying by writing to the outer encbuf directly.
-			return outer.encode(val)
+		// Optimization: reuse *encBuffer when called by EncodeRLP.
+		if buf := encBufferFromWriter(w); buf != nil {
+			return buf.encode(val)
 		}
-		eb := encbufPool.Get().(*encbuf)
-		defer encbufPool.Put(eb)
-		eb.reset()
-		if err := eb.encode(val); err != nil {
+
+		buf := getEncBuffer()
+		defer encBufferPool.Put(buf)
+		if err := buf.encode(val); err != nil {
 			return err
 		}
-		return eb.toWriter(w)
-	}
-	func (w *encbuf) encode(val interface{}) error {
-		rval := reflect.ValueOf(val)
-		ti, err := cachedTypeInfo(rval.Type(), tags{})
-		if err != nil {
-			return err
-		}
-		return ti.writer(rval, w)
+		return buf.writeTo(w)
 	}
 
 ##### encbuf的介绍
@@ -390,29 +394,23 @@ encbuf是encode buffer的简写(我猜的)。encbuf出现在Encode方法，和�
 
 #### 解码器 decode.go
 解码器的大致流程和编码器差不多，理解了编码器的大致流程，也就知道了解码器的大致流程。
+```
+// Decode parses RLP-encoded data from r and stores the result in the value pointed to by
+// val. Please see package-level documentation for the decoding rules. Val must be a
+	// non-nil pointer.
+	//
+	// If r does not implement ByteReader, Decode will do its own buffering.
+	//
+	// Note that Decode does not set an input limit for all readers and may be vulnerable to
+	// panics cause by huge value sizes. If you need an input limit, use
+	//
+	//	NewStream(r, limit).Decode(val)
+	func Decode(r io.Reader, val interface{}) error {
+		stream := streamPool.Get().(*Stream)
+		defer streamPool.Put(stream)
 
-	func (s *Stream) Decode(val interface{}) error {
-		if val == nil {
-			return errDecodeIntoNil
-		}
-		rval := reflect.ValueOf(val)
-		rtyp := rval.Type()
-		if rtyp.Kind() != reflect.Ptr {
-			return errNoPointer
-		}
-		if rval.IsNil() {
-			return errDecodeIntoNil
-		}
-		info, err := cachedTypeInfo(rtyp.Elem(), tags{})
-		if err != nil {
-			return err
-		}
-		err = info.decoder(s, rval.Elem())
-		if decErr, ok := err.(*decodeError); ok && len(decErr.ctx) > 0 {
-			// add decode target type to error so context has more meaning
-			decErr.ctx = append(decErr.ctx, fmt.Sprint("(", rtyp.Elem(), ")"))
-		}
-		return err
+		stream.Reset(r, 0)
+		return stream.Decode(val)
 	}
 
 	func makeDecoder(typ reflect.Type, tags tags) (dec decoder, err error) {
@@ -448,31 +446,48 @@ encbuf是encode buffer的简写(我猜的)。encbuf出现在Encode方法，和�
 		default:
 			return nil, fmt.Errorf("rlp: type %v is not RLP-serializable", typ)
 		}
-	}
-
+	}	
+``` 
 我们同样通过结构体类型的解码过程来查看具体的解码过程。跟编码过程差不多，首先通过structFields获取需要解码的所有字段，然后每个字段进行解码。 跟编码过程差不多有一个List()和ListEnd()的操作，不过这里的处理流程和编码过程不一样，后续章节会详细介绍。
 
-	func makeStructDecoder(typ reflect.Type) (decoder, error) {
-		fields, err := structFields(typ)
-		if err != nil {
-			return nil, err
-		}
-		dec := func(s *Stream, val reflect.Value) (err error) {
-			if _, err := s.List(); err != nil {
-				return wrapStreamError(err, typ)
-			}
-			for _, f := range fields {
-				err := f.info.decoder(s, val.Field(f.index))
-				if err == EOL {
-					return &decodeError{msg: "too few elements", typ: typ}
-				} else if err != nil {
-					return addErrorContext(err, "."+typ.Field(f.index).Name)
-				}
-			}
-			return wrapStreamError(s.ListEnd(), typ)
-		}
-		return dec, nil
+
+```
+func makeStructDecoder(typ reflect.Type) (decoder, error) {
+	fields, err := structFields(typ)
+	if err != nil {
+		return nil, err
 	}
+	for _, f := range fields {
+		if f.info.decoderErr != nil {
+			return nil, structFieldError{typ, f.index, f.info.decoderErr}
+		}
+	}
+	dec := func(s *Stream, val reflect.Value) (err error) {
+		if _, err := s.List(); err != nil {
+			return wrapStreamError(err, typ)
+		}
+		for i, f := range fields {
+			err := f.info.decoder(s, val.Field(f.index))
+			if err == EOL {
+				if f.optional {
+					// The field is optional, so reaching the end of the list before
+					// reaching the last field is acceptable. All remaining undecoded
+					// fields are zeroed.
+					zeroFields(val, fields[i:])
+					break
+				}
+				return &decodeError{msg: "too few elements", typ: typ}
+			} else if err != nil {
+				return addErrorContext(err, "."+typ.Field(f.index).Name)
+			}
+		}
+		return wrapStreamError(s.ListEnd(), typ)
+	}
+	return dec, nil
+}
+
+```
+
 
 下面在看字符串的解码过程，因为不同长度的字符串有不同方式的编码，我们可以通过前缀的不同来获取字符串的类型， 这里我们通过s.Kind()方法获取当前需要解析的类型和长度，如果是Byte类型，那么直接返回Byte的值， 如果是String类型那么读取指定长度的值然后返回。 这就是kind()方法的用途。
 
@@ -502,55 +517,60 @@ encbuf是encode buffer的简写(我猜的)。encbuf出现在Encode方法，和�
 ##### Stream 结构分析
 解码器的其他代码和编码器的结构差不多， 但是有一个特殊的结构是编码器里面没有的。那就是Stream。
 这个是用来读取用流式的方式来解码RLP的一个辅助类。 前面我们讲到了大致的解码流程就是首先通过Kind()方法获取需要解码的对象的类型和长度,然后根据长度和类型进行数据的解码。 那么我们如何处理结构体的字段又是结构体的数据呢， 回忆我们对结构体进行处理的时候，首先调用s.List()方法，然后对每个字段进行解码，最后调用s.EndList()方法。 技巧就在这两个方法里面， 下面我们看看这两个方法。
+```
+type Stream struct {
+	r ByteReader
 
-	type Stream struct {
-		r ByteReader
-		// number of bytes remaining to be read from r.
-		remaining uint64
-		limited   bool
-		// auxiliary buffer for integer decoding
-		uintbuf []byte
-		kind    Kind   // kind of value ahead
-		size    uint64 // size of value ahead
-		byteval byte   // value of single byte in type tag
-		kinderr error  // error from last readKind
-		stack   []listpos
-	}
-	type listpos struct{ pos, size uint64 }
-
+	remaining uint64   // number of bytes remaining to be read from r
+	size      uint64   // size of value ahead
+	kinderr   error    // error from last readKind
+	stack     []uint64 // list sizes
+	uintbuf   [32]byte // auxiliary buffer for integer decoding
+	kind      Kind     // kind of value ahead
+	byteval   byte     // value of single byte in type tag
+	limited   bool     // true if input limit is in effect
+}
+```
 Stream的List方法，当调用List方法的时候。我们先调用Kind方法获取类型和长度，如果类型不匹配那么就抛出错误，然后我们把一个listpos对象压入到堆栈，这个对象是关键。 这个对象的pos字段记录了当前这个list已经读取了多少字节的数据， 所以刚开始的时候肯定是0. size字段记录了这个list对象一共需要读取多少字节数据。这样我在处理后续的每一个字段的时候，每读取一些字节，就会增加pos这个字段的值，处理到最后会对比pos字段和size字段是否相等，如果不相等，那么会抛出异常。
-
-	func (s *Stream) List() (size uint64, err error) {
-		kind, size, err := s.Kind()
-		if err != nil {
-			return 0, err
-		}
-		if kind != List {
-			return 0, ErrExpectedList
-		}
-		s.stack = append(s.stack, listpos{0, size})
-		s.kind = -1
-		s.size = 0
-		return size, nil
+```
+// List starts decoding an RLP list. If the input does not contain a
+// list, the returned error will be ErrExpectedList. When the list's
+// end has been reached, any Stream operation will return EOL.
+func (s *Stream) List() (size uint64, err error) {
+	kind, size, err := s.Kind()
+	if err != nil {
+		return 0, err
+	}
+	if kind != List {
+		return 0, ErrExpectedList
 	}
 
+	// Remove size of inner list from outer list before pushing the new size
+	// onto the stack. This ensures that the remaining outer list size will
+	// be correct after the matching call to ListEnd.
+	if inList, limit := s.listLimit(); inList {
+		s.stack[len(s.stack)-1] = limit - size
+	}
+	s.stack = append(s.stack, size)
+	s.kind = -1
+	s.size = 0
+	return size, nil
+}
+```
 Stream的ListEnd方法，如果当前读取的数据数量pos不等于声明的数据长度size，抛出异常，然后对堆栈进行pop操作，如果当前堆栈不为空，那么就在堆栈的栈顶的pos加上当前处理完毕的数据长度(用来处理这种情况--结构体的字段又是结构体， 这种递归的结构)
-
-	func (s *Stream) ListEnd() error {
-		if len(s.stack) == 0 {
-			return errNotInList
-		}
-		tos := s.stack[len(s.stack)-1]
-		if tos.pos != tos.size {
-			return errNotAtEOL
-		}
-		s.stack = s.stack[:len(s.stack)-1] // pop
-		if len(s.stack) > 0 {
-			s.stack[len(s.stack)-1].pos += tos.size
-		}
-		s.kind = -1
-		s.size = 0
-		return nil
+```
+// ListEnd returns to the enclosing list.
+// The input reader must be positioned at the end of a list.
+func (s *Stream) ListEnd() error {
+	// Ensure that no more data is remaining in the current list.
+	if inList, listLimit := s.listLimit(); !inList {
+		return errNotInList
+	} else if listLimit > 0 {
+		return errNotAtEOL
 	}
-
-
+	s.stack = s.stack[:len(s.stack)-1] // pop
+	s.kind = -1
+	s.size = 0
+	return nil
+}
+```
