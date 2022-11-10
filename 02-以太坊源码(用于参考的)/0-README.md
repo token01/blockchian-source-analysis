@@ -6,7 +6,7 @@
 
 ## 目录
 
-- [go-ethereum代码阅读环境搭建](/go-ethereum源码阅读环境搭建.md)
+- [go-ethereum代码阅读环境搭建](02-以太坊源码(用于参考的)/go-ethereum源码阅读环境搭建.md)
 - [以太坊黄皮书 符号索引](a黄皮书里面出现的所有的符号索引.md)
 - [rlp源码解析](/rlp源码解析.md)
 - [trie源码分析](/trie源码分析.md)
