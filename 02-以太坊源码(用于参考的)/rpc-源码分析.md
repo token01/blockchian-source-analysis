@@ -135,32 +135,13 @@ services字段的value类型是service类型。 service代表了一个注册到S
 	type serviceRegistry map[string]*service // collection of services
 	type callbacks map[string]*callback      // collection of RPC callbacks
 	type subscriptions map[string]*callback 
+	// Server is an RPC server.
 	type Server struct {
-		services serviceRegistry
-	
-		run      int32
-		codecsMu sync.Mutex
-		codecs   *set.Set
-	}
-	
-	// callback is a method callback which was registered in the server
-	type callback struct {
-		rcvr        reflect.Value  // receiver of method
-		method      reflect.Method // callback
-		argTypes    []reflect.Type // input argument types
-		hasCtx      bool           // method's first argument is a context (not included in argTypes)
-		errPos      int            // err return idx, of -1 when method cannot return error
-		isSubscribe bool           // indication if the callback is a subscription
-	}
-	
-	// service represents a registered object
-	type service struct {
-		name          string        // name for service
-		typ           reflect.Type  // receiver type
-		callbacks     callbacks     // registered handlers
-		subscriptions subscriptions // available subscriptions/notifications
-	}
-
+	services serviceRegistry
+	idgen    func() ID
+	run      int32
+	codecs   mapset.Set
+}
 
 Server的创建，Server创建的时候通过调用server.RegisterName把自己的实例注册上来，提供一些RPC服务的元信息。
 		
@@ -181,145 +162,48 @@ Server的创建，Server创建的时候通过调用server.RegisterName把自己�
 		return server
 	}
 
-服务注册server.RegisterName，RegisterName方法会通过传入的参数来创建一个service对象，如过传入的rcvr实例没有找到任何合适的方法，那么会返回错误。 如果没有错误，就把创建的service实例加入serviceRegistry。
+服务注册server.RegisterName，RegisterName方法会通过传入的参数来创建一个service对象，如过传入的rcvr实例没有找到任何合适的方法，那么会返回错误。 如果没有错误，就把创建的service实例加入serviceRegistry。会添加锁来控制这块逻辑如果重新会callback返回数据信息
 
-
-	// RegisterName will create a service for the given rcvr type under the given name. When no methods on the given rcvr
-	// match the criteria to be either a RPC method or a subscription an error is returned. Otherwise a new service is
-	// created and added to the service collection this server instance serves.
-	func (s *Server) RegisterName(name string, rcvr interface{}) error {
-		if s.services == nil {
-			s.services = make(serviceRegistry)
-		}
-	
-		svc := new(service)
-		svc.typ = reflect.TypeOf(rcvr)
-		rcvrVal := reflect.ValueOf(rcvr)
-	
-		if name == "" {
-			return fmt.Errorf("no service name for type %s", svc.typ.String())
-		}
-		//如果实例的类名不是导出的(类名的首字母大写)，就返回错误。
-		if !isExported(reflect.Indirect(rcvrVal).Type().Name()) {
-			return fmt.Errorf("%s is not exported", reflect.Indirect(rcvrVal).Type().Name())
-		}
-		//通过反射信息找到合适的callbacks 和subscriptions方法
-		methods, subscriptions := suitableCallbacks(rcvrVal, svc.typ)
-		//如果这个名字当前已经被注册过了，那么如果有同名的方法就用新的替代，否者直接插入。
-		// already a previous service register under given sname, merge methods/subscriptions
-		if regsvc, present := s.services[name]; present {
-			if len(methods) == 0 && len(subscriptions) == 0 {
-				return fmt.Errorf("Service %T doesn't have any suitable methods/subscriptions to expose", rcvr)
-			}
-			for _, m := range methods {
-				regsvc.callbacks[formatName(m.method.Name)] = m
-			}
-			for _, s := range subscriptions {
-				regsvc.subscriptions[formatName(s.method.Name)] = s
-			}
-			return nil
-		}
-	
-		svc.name = name
-		svc.callbacks, svc.subscriptions = methods, subscriptions
-	
-		if len(svc.callbacks) == 0 && len(svc.subscriptions) == 0 {
-			return fmt.Errorf("Service %T doesn't have any suitable methods/subscriptions to expose", rcvr)
-		}
-	
-		s.services[svc.name] = svc
-		return nil
+```
+func (r *serviceRegistry) registerName(name string, rcvr interface{}) error {
+	rcvrVal := reflect.ValueOf(rcvr)
+	if name == "" {
+		return fmt.Errorf("no service name for type %s", rcvrVal.Type().String())
 	}
+	callbacks := suitableCallbacks(rcvrVal)
+	if len(callbacks) == 0 {
+		return fmt.Errorf("service %T doesn't have any suitable methods/subscriptions to expose", rcvr)
+	}
+
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if r.services == nil {
+		r.services = make(map[string]service)
+	}
+	svc, ok := r.services[name]
+	if !ok {
+		svc = service{
+			name:          name,
+			callbacks:     make(map[string]*callback),
+			subscriptions: make(map[string]*callback),
+		}
+		r.services[name] = svc
+	}
+	for name, cb := range callbacks {
+		if cb.isSubscribe {
+			svc.subscriptions[name] = cb
+		} else {
+			svc.callbacks[name] = cb
+		}
+	}
+	return nil
+}
+```
 
 通过反射信息找出合适的方法，suitableCallbacks，这个方法在utils.go里面。 这个方法会遍历这个类型的所有方法，找到适配RPC callback或者subscription callback类型标准的方法并返回。关于RPC的标准，请参考文档开头的RPC标准。
+```
 
-	// suitableCallbacks iterates over the methods of the given type. It will determine if a method satisfies the criteria
-	// for a RPC callback or a subscription callback and adds it to the collection of callbacks or subscriptions. See server
-	// documentation for a summary of these criteria.
-	func suitableCallbacks(rcvr reflect.Value, typ reflect.Type) (callbacks, subscriptions) {
-		callbacks := make(callbacks)
-		subscriptions := make(subscriptions)
-	
-	METHODS:
-		for m := 0; m < typ.NumMethod(); m++ {
-			method := typ.Method(m)
-			mtype := method.Type
-			mname := formatName(method.Name)
-			if method.PkgPath != "" { // method must be exported
-				continue
-			}
-	
-			var h callback
-			h.isSubscribe = isPubSub(mtype)
-			h.rcvr = rcvr
-			h.method = method
-			h.errPos = -1
-	
-			firstArg := 1
-			numIn := mtype.NumIn()
-			if numIn >= 2 && mtype.In(1) == contextType {
-				h.hasCtx = true
-				firstArg = 2
-			}
-	
-			if h.isSubscribe {
-				h.argTypes = make([]reflect.Type, numIn-firstArg) // skip rcvr type
-				for i := firstArg; i < numIn; i++ {
-					argType := mtype.In(i)
-					if isExportedOrBuiltinType(argType) {
-						h.argTypes[i-firstArg] = argType
-					} else {
-						continue METHODS
-					}
-				}
-	
-				subscriptions[mname] = &h
-				continue METHODS
-			}
-	
-			// determine method arguments, ignore first arg since it's the receiver type
-			// Arguments must be exported or builtin types
-			h.argTypes = make([]reflect.Type, numIn-firstArg)
-			for i := firstArg; i < numIn; i++ {
-				argType := mtype.In(i)
-				if !isExportedOrBuiltinType(argType) {
-					continue METHODS
-				}
-				h.argTypes[i-firstArg] = argType
-			}
-	
-			// check that all returned values are exported or builtin types
-			for i := 0; i < mtype.NumOut(); i++ {
-				if !isExportedOrBuiltinType(mtype.Out(i)) {
-					continue METHODS
-				}
-			}
-	
-			// when a method returns an error it must be the last returned value
-			h.errPos = -1
-			for i := 0; i < mtype.NumOut(); i++ {
-				if isErrorType(mtype.Out(i)) {
-					h.errPos = i
-					break
-				}
-			}
-	
-			if h.errPos >= 0 && h.errPos != mtype.NumOut()-1 {
-				continue METHODS
-			}
-	
-			switch mtype.NumOut() {
-			case 0, 1, 2:
-				if mtype.NumOut() == 2 && h.errPos == -1 { // method must one return value and 1 error
-					continue METHODS
-				}
-				callbacks[mname] = &h
-			}
-		}
-	
-		return callbacks, subscriptions
-	}
-
+```
 
 server启动和服务， server的启动和服务这里参考ipc.go中的一部分代码。可以看到每Accept()一个链接，就启动一个goroutine调用srv.ServeCodec来进行服务，这里也可以看出JsonCodec的功能，Codec类似于装饰器模式，在连接外面包了一层。Codec会放在后续来介绍，这里先简单了解一下。
 
@@ -347,200 +231,34 @@ ServeCodec, 这个方法很简单，提供了codec.Close的关闭功能。 serve
 我们的重磅方法终于出场，serveRequest 这个方法就是Server的主要处理流程。从codec读取请求，找到对应的方法并调用，然后把回应写入codec。
 
 部分标准库的代码可以参考网上的使用教程， sync.WaitGroup 实现了一个信号量的功能。 Context实现上下文管理。
-
-	
-	// serveRequest will reads requests from the codec, calls the RPC callback and
-	// writes the response to the given codec.
-	//
-	// If singleShot is true it will process a single request, otherwise it will handle
-	// requests until the codec returns an error when reading a request (in most cases
-	// an EOF). It executes requests in parallel when singleShot is false.
-	func (s *Server) serveRequest(codec ServerCodec, singleShot bool, options CodecOption) error {
-		var pend sync.WaitGroup
-		defer func() {
-			if err := recover(); err != nil {
-				const size = 64 << 10
-				buf := make([]byte, size)
-				buf = buf[:runtime.Stack(buf, false)]
-				log.Error(string(buf))
-			}
-			s.codecsMu.Lock()
-			s.codecs.Remove(codec)
-			s.codecsMu.Unlock()
-		}()
-	
-		ctx, cancel := context.WithCancel(context.Background())
-		defer cancel()
-	
-		// if the codec supports notification include a notifier that callbacks can use
-		// to send notification to clients. It is thight to the codec/connection. If the
-		// connection is closed the notifier will stop and cancels all active subscriptions.
-		if options&OptionSubscriptions == OptionSubscriptions {
-			ctx = context.WithValue(ctx, notifierKey{}, newNotifier(codec))
-		}
-		s.codecsMu.Lock()
-		if atomic.LoadInt32(&s.run) != 1 { // server stopped
-			s.codecsMu.Unlock()
-			return &shutdownError{}
-		}
-		s.codecs.Add(codec)
-		s.codecsMu.Unlock()
-	
-		// test if the server is ordered to stop
-		for atomic.LoadInt32(&s.run) == 1 {
-			reqs, batch, err := s.readRequest(codec)
-			if err != nil {
-				// If a parsing error occurred, send an error
-				if err.Error() != "EOF" {
-					log.Debug(fmt.Sprintf("read error %v\n", err))
-					codec.Write(codec.CreateErrorResponse(nil, err))
-				}
-				// Error or end of stream, wait for requests and tear down
-				//这里主要是考虑多线程处理的时候等待所有的request处理完毕，
-				//每启动一个go线程会调用pend.Add(1)。 
-				//处理完成后调用pend.Done()会减去1。当为0的时候，Wait()方法就会返回。
-				pend.Wait()
-				return nil
-			}
-	
-			// check if server is ordered to shutdown and return an error
-			// telling the client that his request failed.
-			if atomic.LoadInt32(&s.run) != 1 {
-				err = &shutdownError{}
-				if batch {
-					resps := make([]interface{}, len(reqs))
-					for i, r := range reqs {
-						resps[i] = codec.CreateErrorResponse(&r.id, err)
-					}
-					codec.Write(resps)
-				} else {
-					codec.Write(codec.CreateErrorResponse(&reqs[0].id, err))
-				}
-				return nil
-			}
-			// If a single shot request is executing, run and return immediately
-			//如果只执行一次，那么执行完成后返回。
-			if singleShot {
-				if batch {
-					s.execBatch(ctx, codec, reqs)
-				} else {
-					s.exec(ctx, codec, reqs[0])
-				}
-				return nil
-			}
-			// For multi-shot connections, start a goroutine to serve and loop back
-			pend.Add(1)
-			//启动线程对请求进行服务。
-			go func(reqs []*serverRequest, batch bool) {
-				defer pend.Done()
-				if batch {
-					s.execBatch(ctx, codec, reqs)
-				} else {
-					s.exec(ctx, codec, reqs[0])
-				}
-			}(reqs, batch)
-		}
-		return nil
+```
+// serveSingleRequest reads and processes a single RPC request from the given codec. This
+// is used to serve HTTP connections. Subscriptions and reverse calls are not allowed in
+// this mode.
+func (s *Server) serveSingleRequest(ctx context.Context, codec ServerCodec) {
+	// Don't serve if server is stopped.
+	if atomic.LoadInt32(&s.run) == 0 {
+		return
 	}
 
+	h := newHandler(ctx, codec, s.idgen, &s.services)
+	h.allowSubscribe = false
+	defer h.close(io.EOF, nil)
 
-readRequest方法，从codec读取请求，然后根据请求查找对应的方法组装成requests对象。
-rpcRequest是codec返回的请求类型。j	
-
-	type rpcRequest struct {
-		service  string
-		method   string
-		id       interface{}
-		isPubSub bool
-		params   interface{}
-		err      Error // invalid batch element
-	}
-
-serverRequest进行处理之后返回的request
-
-	// serverRequest is an incoming request
-	type serverRequest struct {
-		id            interface{}
-		svcname       string
-		callb         *callback
-		args          []reflect.Value
-		isUnsubscribe bool
-		err           Error
-	}
-
-readRequest方法，从codec读取请求，对请求进行处理生成serverRequest对象返回。
-
-	// readRequest requests the next (batch) request from the codec. It will return the collection
-	// of requests, an indication if the request was a batch, the invalid request identifier and an
-	// error when the request could not be read/parsed.
-	func (s *Server) readRequest(codec ServerCodec) ([]*serverRequest, bool, Error) {
-		reqs, batch, err := codec.ReadRequestHeaders()
-		if err != nil {
-			return nil, batch, err
+	reqs, batch, err := codec.readBatch()
+	if err != nil {
+		if err != io.EOF {
+			codec.writeJSON(ctx, errorMessage(&invalidMessageError{"parse error"}))
 		}
-		requests := make([]*serverRequest, len(reqs))
-		// 根据reqs构建requests
-		// verify requests
-		for i, r := range reqs {
-			var ok bool
-			var svc *service
-	
-			if r.err != nil {
-				requests[i] = &serverRequest{id: r.id, err: r.err}
-				continue
-			}
-			//如果请求是发送/订阅方面的请求，而且方法名称有_unsubscribe后缀。
-			if r.isPubSub && strings.HasSuffix(r.method, unsubscribeMethodSuffix) {
-				requests[i] = &serverRequest{id: r.id, isUnsubscribe: true}
-				argTypes := []reflect.Type{reflect.TypeOf("")} // expect subscription id as first arg
-				if args, err := codec.ParseRequestArguments(argTypes, r.params); err == nil {
-					requests[i].args = args
-				} else {
-					requests[i].err = &invalidParamsError{err.Error()}
-				}
-				continue
-			}
-			//如果没有注册这个服务。
-			if svc, ok = s.services[r.service]; !ok { // rpc method isn't available
-				requests[i] = &serverRequest{id: r.id, err: &methodNotFoundError{r.service, r.method}}
-				continue
-			}
-			//如果是发布和订阅模式。 调用订阅方法。
-			if r.isPubSub { // eth_subscribe, r.method contains the subscription method name
-				if callb, ok := svc.subscriptions[r.method]; ok {
-					requests[i] = &serverRequest{id: r.id, svcname: svc.name, callb: callb}
-					if r.params != nil && len(callb.argTypes) > 0 {
-						argTypes := []reflect.Type{reflect.TypeOf("")}
-						argTypes = append(argTypes, callb.argTypes...)
-						if args, err := codec.ParseRequestArguments(argTypes, r.params); err == nil {
-							requests[i].args = args[1:] // first one is service.method name which isn't an actual argument
-						} else {
-							requests[i].err = &invalidParamsError{err.Error()}
-						}
-					}
-				} else {
-					requests[i] = &serverRequest{id: r.id, err: &methodNotFoundError{r.method, r.method}}
-				}
-				continue
-			}
-	
-			if callb, ok := svc.callbacks[r.method]; ok { // lookup RPC method
-				requests[i] = &serverRequest{id: r.id, svcname: svc.name, callb: callb}
-				if r.params != nil && len(callb.argTypes) > 0 {
-					if args, err := codec.ParseRequestArguments(callb.argTypes, r.params); err == nil {
-						requests[i].args = args
-					} else {
-						requests[i].err = &invalidParamsError{err.Error()}
-					}
-				}
-				continue
-			}
-	
-			requests[i] = &serverRequest{id: r.id, err: &methodNotFoundError{r.service, r.method}}
-		}
-	
-		return requests, batch, nil
+		return
 	}
+	if batch {
+		h.handleBatch(reqs)
+	} else {
+		h.handleMsg(reqs[0])
+	}
+}
+```
 
 exec和execBatch方法,调用s.handle方法对request进行处理。 
 
@@ -782,66 +500,48 @@ createSubscription方法会调用指定的注册上来的方法，并得到回�
 
 客户端的数据结构
 
-	// Client represents a connection to an RPC server.
-	type Client struct {
-		idCounter   uint32
-		//生成连接的函数，客户端会调用这个函数生成一个网络连接对象。
-		connectFunc func(ctx context.Context) (net.Conn, error)
-		//HTTP协议和非HTTP协议有不同的处理流程， HTTP协议不支持长连接， 只支持一个请求对应一个回应的这种模式，同时也不支持发布/订阅模式。 
-		isHTTP      bool
-	
-		// writeConn is only safe to access outside dispatch, with the
-		// write lock held. The write lock is taken by sending on
-		// requestOp and released by sending on sendDone.
-		//通过这里的注释可以看到，writeConn是调用这用来写入请求的网络连接对象，
-		//只有在dispatch方法外面调用才是安全的，而且需要通过给requestOp队列发送请求来获取锁，
-		//获取锁之后就可以把请求写入网络，写入完成后发送请求给sendDone队列来释放锁，供其它的请求使用。
-		writeConn net.Conn
-	
-		// for dispatch
-		//下面有很多的channel，channel一般来说是goroutine之间用来通信的通道，后续会随着代码介绍channel是如何使用的。
-		close       chan struct{}
-		didQuit     chan struct{}                  // closed when client quits
-		reconnected chan net.Conn                  // where write/reconnect sends the new connection
-		readErr     chan error                     // errors from read
-		readResp    chan []*jsonrpcMessage         // valid messages from read
-		requestOp   chan *requestOp                // for registering response IDs
-		sendDone    chan error                     // signals write completion, releases write lock
-		respWait    map[string]*requestOp          // active requests
-		subs        map[string]*ClientSubscription // active subscriptions
-	}
+```
 
+// Client represents a connection to an RPC server.
+type Client struct {
+	idgen    func() ID // for subscriptions
+	isHTTP   bool      // connection type: http, ws or ipc
+	services *serviceRegistry
 
+	idCounter uint32
+
+	// This function, if non-nil, is called when the connection is lost.
+	reconnectFunc reconnectFunc
+
+	// writeConn is used for writing to the connection on the caller's goroutine. It should
+	// only be accessed outside of dispatch, with the write lock held. The write lock is
+	// taken by sending on reqInit and released by sending on reqSent.
+	writeConn jsonWriter
+
+	// for dispatch
+	close       chan struct{}
+	closing     chan struct{}    // closed when client is quitting
+	didClose    chan struct{}    // closed when client quits
+	reconnected chan ServerCodec // where write/reconnect sends the new connection
+	readOp      chan readOp      // read messages
+	readErr     chan error       // errors from read
+	reqInit     chan *requestOp  // register response IDs, takes write lock
+	reqSent     chan error       // signals write completion, releases write lock
+	reqTimeout  chan *requestOp  // removes response IDs when call timeout expires
+}
+
+```
 newClient， 新建一个客户端。 通过调用connectFunc方法来获取一个网络连接，如果网络连接是httpConn对象的化，那么isHTTP设置为true。然后是对象的初始化， 如果是HTTP连接的化，直接返回，否者就启动一个goroutine调用dispatch方法。 dispatch方法是整个client的指挥中心，通过上面提到的channel来和其他的goroutine来进行通信，获取信息，根据信息做出各种决策。后续会详细介绍dispatch。 因为HTTP的调用方式非常简单， 这里先对HTTP的方式做一个简单的阐述。
 
-	
-	func newClient(initctx context.Context, connectFunc func(context.Context) (net.Conn, error)) (*Client, error) {
-		conn, err := connectFunc(initctx)
-		if err != nil {
-			return nil, err
-		}
-		_, isHTTP := conn.(*httpConn)
-	
-		c := &Client{
-			writeConn:   conn,
-			isHTTP:      isHTTP,
-			connectFunc: connectFunc,
-			close:       make(chan struct{}),
-			didQuit:     make(chan struct{}),
-			reconnected: make(chan net.Conn),
-			readErr:     make(chan error),
-			readResp:    make(chan []*jsonrpcMessage),
-			requestOp:   make(chan *requestOp),
-			sendDone:    make(chan error, 1),
-			respWait:    make(map[string]*requestOp),
-			subs:        make(map[string]*ClientSubscription),
-		}
-		if !isHTTP {
-			go c.dispatch(conn)
-		}
-		return c, nil
-	}
-
+```
+func (c *Client) newClientConn(conn ServerCodec) *clientConn {
+	ctx := context.Background()
+	ctx = context.WithValue(ctx, clientContextKey{}, c)
+	ctx = context.WithValue(ctx, peerInfoContextKey{}, conn.peerInfo())
+	handler := newHandler(ctx, conn, c.idgen, c.services)
+	return &clientConn{conn, handler}
+}
+```
 
 请求调用通过调用client的 Call方法来进行RPC调用。
 
