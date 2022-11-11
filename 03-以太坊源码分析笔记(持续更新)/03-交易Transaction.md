@@ -39,10 +39,19 @@ type TxData interface {
 }
 ```
 
-对应两个创建方法，内部调用newTransaction实现
+对应两个创建方法，内部调用newTransaction实现 （新版本已经弃用）
 
 1. 创建普通交易
 2. 创建合约，to字段为nil
+```go
+
+// NewTx creates a new transaction.
+func NewTx(inner TxData) *Transaction {
+	tx := new(Transaction)
+	tx.setDecoded(inner.copy(), 0)
+	return tx
+}
+```
 
 ```go
 func NewTransaction(nonce uint64, to common.Address, amount *big.Int, gasLimit uint64, gasPrice *big.Int, data []byte) *Transaction {
