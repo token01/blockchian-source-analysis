@@ -1,33 +1,41 @@
 core->types->transaction.go
 
 ```go
+// Transaction is an Ethereum transaction.
 type Transaction struct {
- data txdata
- // caches
- hash atomic.Value
- size atomic.Value
- from atomic.Value
+	inner TxData    // Consensus contents of a transaction
+	time  time.Time // Time first seen locally (spam avoidance)
+
+	// caches
+	hash atomic.Value
+	size atomic.Value
+	from atomic.Value
 }
 ```
 
 txdata
 
 ```go
-type txdata struct {
- AccountNonce uint64          `json:"nonce"    gencodec:"required"`
- Price        *big.Int        `json:"gasPrice" gencodec:"required"`
- GasLimit     uint64          `json:"gas"      gencodec:"required"`
- Recipient    *common.Address `json:"to"       rlp:"nil"` // nil means contract creation
- Amount       *big.Int        `json:"value"    gencodec:"required"`
- Payload      []byte          `json:"input"    gencodec:"required"`
+// TxData is the underlying data of a transaction.
+//
+// This is implemented by DynamicFeeTx, LegacyTx and AccessListTx.
+type TxData interface {
+	txType() byte // returns the type ID
+	copy() TxData // creates a deep copy and initializes all fields
 
- // Signature values
- V *big.Int `json:"v" gencodec:"required"`
- R *big.Int `json:"r" gencodec:"required"`
- S *big.Int `json:"s" gencodec:"required"`
+	chainID() *big.Int
+	accessList() AccessList
+	data() []byte
+	gas() uint64
+	gasPrice() *big.Int
+	gasTipCap() *big.Int
+	gasFeeCap() *big.Int
+	value() *big.Int
+	nonce() uint64
+	to() *common.Address
 
- // This is only used when marshaling to JSON.
- Hash *common.Hash `json:"hash" rlp:"-"`
+	rawSignatureValues() (v, r, s *big.Int)
+	setSignatureValues(chainID, v, r, s *big.Int)
 }
 ```
 
