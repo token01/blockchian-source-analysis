@@ -70,15 +70,24 @@ func NewContractCreation(nonce uint64, amount *big.Int, gasLimit uint64, gasPric
 > // NOTE: In a future PR this will be removed.
 
 ```go
-type Message struct {
- to         *common.Address
- from       common.Address
- nonce      uint64
- amount     *big.Int
- gasLimit   uint64
- gasPrice   *big.Int
- data       []byte
- checkNonce bool
+// This is implemented by DynamicFeeTx, LegacyTx and AccessListTx.
+type TxData interface {
+	txType() byte // returns the type ID
+	copy() TxData // creates a deep copy and initializes all fields
+
+	chainID() *big.Int
+	accessList() AccessList
+	data() []byte
+	gas() uint64
+	gasPrice() *big.Int
+	gasTipCap() *big.Int
+	gasFeeCap() *big.Int
+	value() *big.Int
+	nonce() uint64
+	to() *common.Address
+
+	rawSignatureValues() (v, r, s *big.Int)
+	setSignatureValues(chainID, v, r, s *big.Int)
 }
 ```
 
