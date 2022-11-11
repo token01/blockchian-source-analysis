@@ -324,101 +324,83 @@ receiverEncHandshake函数和initiatorEncHandshake的内容大致相同。 但�
 	}
 
 
-### rlpxFrameRW 数据分帧
-数据分帧主要通过rlpxFrameRW类来完成的。
+### sessionState 数据分帧
+数据分帧主要通过sessionState类来完成的。
+```
+// sessionState contains the session keys.
+type sessionState struct {
+	enc cipher.Stream
+	dec cipher.Stream
 
+	egressMAC  hashMAC
+	ingressMAC hashMAC
+	rbuf       readBuffer
+	wbuf       writeBuffer
+}
+```
+我们在完成两次握手之后。调用newRLPX方法创建了这个对象。
 
-	// rlpxFrameRW implements a simplified version of RLPx framing.
-	// chunked messages are not supported and all headers are equal to
-	// zeroHeader.
-	//
-	// rlpxFrameRW is not safe for concurrent use from multiple goroutines.
-	type rlpxFrameRW struct {
-		conn io.ReadWriter
-		enc  cipher.Stream
-		dec  cipher.Stream
-	
-		macCipher  cipher.Block
-		egressMAC  hash.Hash
-		ingressMAC hash.Hash
-	
-		snappy bool
-	}
-
-我们在完成两次握手之后。调用newRLPXFrameRW方法创建了这个对象。
-
-	t.rw = newRLPXFrameRW(t.fd, sec)
+```
+func newRLPX(conn net.Conn, dialDest *ecdsa.PublicKey) transport {
+	return &rlpxTransport{conn: rlpx.NewConn(conn, dialDest)}
+}
+```
 
 然后提供ReadMsg和WriteMsg方法。这两个方法直接调用了rlpxFrameRW的ReadMsg和WriteMsg
+```
+func (t *rlpxTransport) ReadMsg() (Msg, error) {
+	t.rmu.Lock()
+	defer t.rmu.Unlock()
 
-
-	func (t *rlpx) ReadMsg() (Msg, error) {
-		t.rmu.Lock()
-		defer t.rmu.Unlock()
-		t.fd.SetReadDeadline(time.Now().Add(frameReadTimeout))
-		return t.rw.ReadMsg()
+	var msg Msg
+	t.conn.SetReadDeadline(time.Now().Add(frameReadTimeout))
+	code, data, wireSize, err := t.conn.Read()
+	if err == nil {
+		// Protocol messages are dispatched to subprotocol handlers asynchronously,
+		// but package rlpx may reuse the returned 'data' buffer on the next call
+		// to Read. Copy the message data to avoid this being an issue.
+		data = common.CopyBytes(data)
+		msg = Msg{
+			ReceivedAt: time.Now(),
+			Code:       code,
+			Size:       uint32(len(data)),
+			meterSize:  uint32(wireSize),
+			Payload:    bytes.NewReader(data),
+		}
 	}
-	func (t *rlpx) WriteMsg(msg Msg) error {
-		t.wmu.Lock()
-		defer t.wmu.Unlock()
-		t.fd.SetWriteDeadline(time.Now().Add(frameWriteTimeout))
-		return t.rw.WriteMsg(msg)
-	}
+	return msg, err
+}
+```
 
 WriteMsg
+```
+func (t *rlpxTransport) WriteMsg(msg Msg) error {
+	t.wmu.Lock()
+	defer t.wmu.Unlock()
 
-	func (rw *rlpxFrameRW) WriteMsg(msg Msg) error {
-		ptype, _ := rlp.EncodeToBytes(msg.Code)
-	
-		// if snappy is enabled, compress message now
-		if rw.snappy {
-			if msg.Size > maxUint24 {
-				return errPlainMessageTooLarge
-			}
-			payload, _ := ioutil.ReadAll(msg.Payload)
-			payload = snappy.Encode(nil, payload)
-	
-			msg.Payload = bytes.NewReader(payload)
-			msg.Size = uint32(len(payload))
-		}
-		// write header
-		headbuf := make([]byte, 32)
-		fsize := uint32(len(ptype)) + msg.Size
-		if fsize > maxUint24 {
-			return errors.New("message size overflows uint24")
-		}
-		putInt24(fsize, headbuf) // TODO: check overflow
-		copy(headbuf[3:], zeroHeader)
-		rw.enc.XORKeyStream(headbuf[:16], headbuf[:16]) // first half is now encrypted
-	
-		// write header MAC
-		copy(headbuf[16:], updateMAC(rw.egressMAC, rw.macCipher, headbuf[:16]))
-		if _, err := rw.conn.Write(headbuf); err != nil {
-			return err
-		}
-	
-		// write encrypted frame, updating the egress MAC hash with
-		// the data written to conn.
-		tee := cipher.StreamWriter{S: rw.enc, W: io.MultiWriter(rw.conn, rw.egressMAC)}
-		if _, err := tee.Write(ptype); err != nil {
-			return err
-		}
-		if _, err := io.Copy(tee, msg.Payload); err != nil {
-			return err
-		}
-		if padding := fsize % 16; padding > 0 {
-			if _, err := tee.Write(zero16[:16-padding]); err != nil {
-				return err
-			}
-		}
-	
-		// write frame MAC. egress MAC hash is up to date because
-		// frame content was written to it as well.
-		fmacseed := rw.egressMAC.Sum(nil)
-		mac := updateMAC(rw.egressMAC, rw.macCipher, fmacseed)
-		_, err := rw.conn.Write(mac)
+	// Copy message data to write buffer.
+	t.wbuf.Reset()
+	if _, err := io.CopyN(&t.wbuf, msg.Payload, int64(msg.Size)); err != nil {
 		return err
 	}
+
+	// Write the message.
+	t.conn.SetWriteDeadline(time.Now().Add(frameWriteTimeout))
+	size, err := t.conn.Write(msg.Code, t.wbuf.Bytes())
+	if err != nil {
+		return err
+	}
+
+	// Set metrics.
+	msg.meterSize = size
+	if metrics.Enabled && msg.meterCap.Name != "" { // don't meter non-subprotocol messages
+		m := fmt.Sprintf("%s/%s/%d/%#02x", egressMeterName, msg.meterCap.Name, msg.meterCap.Version, msg.meterCode)
+		metrics.GetOrRegisterMeter(m, nil).Mark(int64(msg.meterSize))
+		metrics.GetOrRegisterMeter(m+"/packets", nil).Mark(1)
+	}
+	return nil
+}
+```
 
 ReadMsg
 

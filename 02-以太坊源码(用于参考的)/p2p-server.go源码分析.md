@@ -1,156 +1,154 @@
 server是p2p的最主要的部分。集合了所有之前的组件。
 
 首先看看Server的结构
+```
+// Server manages all peer connections.
+type Server struct {
+	// Config fields may not be modified while the server is running.
+	Config
 
-	
-	// Server manages all peer connections.
-	type Server struct {
-		// Config fields may not be modified while the server is running.
-		Config
-	
-		// Hooks for testing. These are useful because we can inhibit
-		// the whole protocol stack.
-		newTransport func(net.Conn) transport
-		newPeerHook  func(*Peer)
-	
-		lock    sync.Mutex // protects running
-		running bool
-	
-		ntab         discoverTable
-		listener     net.Listener
-		ourHandshake *protoHandshake
-		lastLookup   time.Time
-		DiscV5       *discv5.Network
-	
-		// These are for Peers, PeerCount (and nothing else).
-		peerOp     chan peerOpFunc
-		peerOpDone chan struct{}
-	
-		quit          chan struct{}
-		addstatic     chan *discover.Node
-		removestatic  chan *discover.Node
-		posthandshake chan *conn
-		addpeer       chan *conn
-		delpeer       chan peerDrop
-		loopWG        sync.WaitGroup // loop, listenLoop
-		peerFeed      event.Feed
-	}
+	// Hooks for testing. These are useful because we can inhibit
+	// the whole protocol stack.
+	newTransport func(net.Conn, *ecdsa.PublicKey) transport
+	newPeerHook  func(*Peer)
+	listenFunc   func(network, addr string) (net.Listener, error)
 
-	// conn wraps a network connection with information gathered
-	// during the two handshakes.
-	type conn struct {
-		fd net.Conn
-		transport
-		flags connFlag
-		cont  chan error      // The run loop uses cont to signal errors to SetupConn.
-		id    discover.NodeID // valid after the encryption handshake
-		caps  []Cap           // valid after the protocol handshake
-		name  string          // valid after the protocol handshake
-	}
+	lock    sync.Mutex // protects running
+	running bool
 
-	type transport interface {
-		// The two handshakes.
-		doEncHandshake(prv *ecdsa.PrivateKey, dialDest *discover.Node) (discover.NodeID, error)
-		doProtoHandshake(our *protoHandshake) (*protoHandshake, error)
-		// The MsgReadWriter can only be used after the encryption
-		// handshake has completed. The code uses conn.id to track this
-		// by setting it to a non-nil value after the encryption handshake.
-		MsgReadWriter
-		// transports must provide Close because we use MsgPipe in some of
-		// the tests. Closing the actual network connection doesn't do
-		// anything in those tests because NsgPipe doesn't use it.
-		close(err error)
-	}
+	listener     net.Listener
+	ourHandshake *protoHandshake
+	loopWG       sync.WaitGroup // loop, listenLoop
+	peerFeed     event.Feed
+	log          log.Logger
+
+	nodedb    *enode.DB
+	localnode *enode.LocalNode
+	ntab      *discover.UDPv4
+	DiscV5    *discover.UDPv5
+	discmix   *enode.FairMix
+	dialsched *dialScheduler
+
+	// Channels into the run loop.
+	quit                    chan struct{}
+	addtrusted              chan *enode.Node
+	removetrusted           chan *enode.Node
+	peerOp                  chan peerOpFunc
+	peerOpDone              chan struct{}
+	delpeer                 chan peerDrop
+	checkpointPostHandshake chan *conn
+	checkpointAddPeer       chan *conn
+
+	// State of run loop and listenLoop.
+	inboundHistory expHeap
+}
+
+type peerOpFunc func(map[enode.ID]*Peer)
+
+type peerDrop struct {
+	*Peer
+	err       error
+	requested bool // true if signaled by the peer
+}
+
+type connFlag int32
+
+const (
+	dynDialedConn connFlag = 1 << iota
+	staticDialedConn
+	inboundConn
+	trustedConn
+)
+
+// conn wraps a network connection with information gathered
+// during the two handshakes.
+type conn struct {
+	fd net.Conn
+	transport
+	node  *enode.Node
+	flags connFlag
+	cont  chan error // The run loop uses cont to signal errors to SetupConn.
+	caps  []Cap      // valid after the protocol handshake
+	name  string     // valid after the protocol handshake
+}
+
+type transport interface {
+	// The two handshakes.
+	doEncHandshake(prv *ecdsa.PrivateKey) (*ecdsa.PublicKey, error)
+	doProtoHandshake(our *protoHandshake) (*protoHandshake, error)
+	// The MsgReadWriter can only be used after the encryption
+	// handshake has completed. The code uses conn.id to track this
+	// by setting it to a non-nil value after the encryption handshake.
+	MsgReadWriter
+	// transports must provide Close because we use MsgPipe in some of
+	// the tests. Closing the actual network connection doesn't do
+	// anything in those tests because MsgPipe doesn't use it.
+	close(err error)
+}
+```
 
 并不存在一个newServer的方法。 初始化的工作放在Start()方法中。
 
-
-	// Start starts running the server.
-	// Servers can not be re-used after stopping.
-	func (srv *Server) Start() (err error) {
-		srv.lock.Lock()
-		defer srv.lock.Unlock()
-		if srv.running { //避免多次启动。 srv.lock为了避免多线程重复启动
-			return errors.New("server already running")
-		}
-		srv.running = true
-		log.Info("Starting P2P networking")
-	
-		// static fields
-		if srv.PrivateKey == nil {
-			return fmt.Errorf("Server.PrivateKey must be set to a non-nil key")
-		}
-		if srv.newTransport == nil {		//这里注意的是Transport使用了newRLPX 使用了rlpx.go中的网络协议。
-			srv.newTransport = newRLPX
-		}
-		if srv.Dialer == nil { //使用了TCLPDialer
-			srv.Dialer = TCPDialer{&net.Dialer{Timeout: defaultDialTimeout}}
-		}
-		srv.quit = make(chan struct{})
-		srv.addpeer = make(chan *conn)
-		srv.delpeer = make(chan peerDrop)
-		srv.posthandshake = make(chan *conn)
-		srv.addstatic = make(chan *discover.Node)
-		srv.removestatic = make(chan *discover.Node)
-		srv.peerOp = make(chan peerOpFunc)
-		srv.peerOpDone = make(chan struct{})
-	
-		// node table
-		if !srv.NoDiscovery {  //启动discover网络。 开启UDP的监听。
-			ntab, err := discover.ListenUDP(srv.PrivateKey, srv.ListenAddr, srv.NAT, srv.NodeDatabase, srv.NetRestrict)
-			if err != nil {
-				return err
-			}
-			//设置最开始的启动节点。当找不到其他的节点的时候。 那么就连接这些启动节点。这些节点的信息是写死在配置文件里面的。
-			if err := ntab.SetFallbackNodes(srv.BootstrapNodes); err != nil {
-				return err
-			}
-			srv.ntab = ntab
-		}
-	
-		if srv.DiscoveryV5 {//这是新的节点发现协议。 暂时还没有使用。  这里暂时没有分析。
-			ntab, err := discv5.ListenUDP(srv.PrivateKey, srv.DiscoveryV5Addr, srv.NAT, "", srv.NetRestrict) //srv.NodeDatabase)
-			if err != nil {
-				return err
-			}
-			if err := ntab.SetFallbackNodes(srv.BootstrapNodesV5); err != nil {
-				return err
-			}
-			srv.DiscV5 = ntab
-		}
-	
-		dynPeers := (srv.MaxPeers + 1) / 2
-		if srv.NoDiscovery {
-			dynPeers = 0
-		}	
-		//创建dialerstate。 
-		dialer := newDialState(srv.StaticNodes, srv.BootstrapNodes, srv.ntab, dynPeers, srv.NetRestrict)
-	
-		// handshake
-		//我们自己的协议的handShake 
-		srv.ourHandshake = &protoHandshake{Version: baseProtocolVersion, Name: srv.Name, ID: discover.PubkeyID(&srv.PrivateKey.PublicKey)}
-		for _, p := range srv.Protocols {//增加所有的协议的Caps
-			srv.ourHandshake.Caps = append(srv.ourHandshake.Caps, p.cap())
-		}
-		// listen/dial
-		if srv.ListenAddr != "" {
-			//开始监听TCP端口
-			if err := srv.startListening(); err != nil {
-				return err
-			}
-		}
-		if srv.NoDial && srv.ListenAddr == "" {
-			log.Warn("P2P server will be useless, neither dialing nor listening")
-		}
-	
-		srv.loopWG.Add(1)
-		//启动goroutine 来处理程序。
-		go srv.run(dialer)
-		srv.running = true
-		return nil
+```
+// Start starts running the server.
+// Servers can not be re-used after stopping.
+func (srv *Server) Start() (err error) {
+	srv.lock.Lock()
+	defer srv.lock.Unlock()
+	if srv.running { //避免多次启动。 srv.lock为了避免多线程重复启动
+		return errors.New("server already running")
+	}
+	srv.running = true
+	srv.log = srv.Config.Logger
+	if srv.log == nil { //判断是否为根节点启动
+		srv.log = log.Root()
+	}
+	if srv.clock == nil {
+		srv.clock = mclock.System{}
+	}
+	if srv.NoDial && srv.ListenAddr == "" {
+		srv.log.Warn("P2P server will be useless, neither dialing nor listening")
 	}
 
+	// static fields
+	if srv.PrivateKey == nil {
+		return errors.New("Server.PrivateKey must be set to a non-nil key")
+	}
+	if srv.newTransport == nil { //这里注意的是Transport使用了newRLPX 使用了rlpx.go中的网络协议。
+		srv.newTransport = newRLPX
+	}
+	if srv.listenFunc == nil {
+		srv.listenFunc = net.Listen
+	}
+	srv.quit = make(chan struct{})
+	srv.delpeer = make(chan peerDrop)
+	srv.checkpointPostHandshake = make(chan *conn)
+	srv.checkpointAddPeer = make(chan *conn)
+	srv.addtrusted = make(chan *enode.Node)
+	srv.removetrusted = make(chan *enode.Node)
+	srv.peerOp = make(chan peerOpFunc)
+	srv.peerOpDone = make(chan struct{})
 
+	if err := srv.setupLocalNode(); err != nil {
+		return err
+	}
+	if srv.ListenAddr != "" {
+		// 开启监听tcp端口
+		if err := srv.setupListening(); err != nil {
+			return err
+		}
+	}
+	if err := srv.setupDiscovery(); err != nil {
+		return err
+	}
+	srv.setupDialScheduler()
+
+	srv.loopWG.Add(1)
+	//启动horoutine 来处理程序
+	go srv.run()
+	return nil
+}
+```
 启动监听。 可以看到是TCP协议。 这里的监听端口和UDP的端口是一样的。 默认都是30303
 	
 	func (srv *Server) startListening() error {
@@ -176,134 +174,148 @@ server是p2p的最主要的部分。集合了所有之前的组件。
 	}
 
 listenLoop()。 这是一个死循环的goroutine。 会监听端口并接收外部的请求。
-	
-	// listenLoop runs in its own goroutine and accepts
-	// inbound connections.
-	func (srv *Server) listenLoop() {
-		defer srv.loopWG.Done()
-		log.Info("RLPx listener up", "self", srv.makeSelf(srv.listener, srv.ntab))
-	
-		// This channel acts as a semaphore limiting
-		// active inbound connections that are lingering pre-handshake.
-		// If all slots are taken, no further connections are accepted.
-		tokens := maxAcceptConns
-		if srv.MaxPendingPeers > 0 {
-			tokens = srv.MaxPendingPeers
-		}
-		//创建maxAcceptConns个槽位。 我们只同时处理这么多连接。 多了也不要。
-		slots := make(chan struct{}, tokens)
-		//把槽位填满。
-		for i := 0; i < tokens; i++ {
-			slots <- struct{}{}
-		}
-	
-		for {
-			// Wait for a handshake slot before accepting.
+```
+
+// listenLoop runs in its own goroutine and accepts
+// inbound connections.
+func (srv *Server) listenLoop() {
+	srv.log.Debug("TCP listener up", "addr", srv.listener.Addr())
+
+	// The slots channel limits accepts of new connections.
+	tokens := defaultMaxPendingPeers
+	if srv.MaxPendingPeers > 0 {
+		tokens = srv.MaxPendingPeers
+	}
+	//创建maxAcceptConns个槽位。 我们只同时处理这么多连接。 多了也不要。
+	slots := make(chan struct{}, tokens)
+	//把槽位填满
+	for i := 0; i < tokens; i++ {
+		slots <- struct{}{}
+	}
+
+	// Wait for slots to be returned on exit. This ensures all connection goroutines
+	// are down before listenLoop returns.
+	defer srv.loopWG.Done()
+	defer func() {
+		for i := 0; i < cap(slots); i++ {
 			<-slots
-	
-			var (
-				fd  net.Conn
-				err error
-			)
-			for {
-				fd, err = srv.listener.Accept()
-				if tempErr, ok := err.(tempError); ok && tempErr.Temporary() {
-					log.Debug("Temporary read error", "err", err)
-					continue
-				} else if err != nil {
-					log.Debug("Read error", "err", err)
-					return
+		}
+	}()
+
+	for {
+		// Wait for a free slot before accepting.
+		<-slots
+
+		var (
+			fd      net.Conn
+			err     error
+			lastLog time.Time
+		)
+		for {
+			fd, err = srv.listener.Accept()
+			if netutil.IsTemporaryError(err) {
+				if time.Since(lastLog) > 1*time.Second {
+					srv.log.Debug("Temporary read error", "err", err)
+					lastLog = time.Now()
 				}
-				break
-			}
-	
-			// Reject connections that do not match NetRestrict.
-			// 白名单。 如果不在白名单里面。那么关闭连接。
-			if srv.NetRestrict != nil {
-				if tcp, ok := fd.RemoteAddr().(*net.TCPAddr); ok && !srv.NetRestrict.Contains(tcp.IP) {
-					log.Debug("Rejected conn (not whitelisted in NetRestrict)", "addr", fd.RemoteAddr())
-					fd.Close()
-					slots <- struct{}{}
-					continue
-				}
-			}
-	
-			fd = newMeteredConn(fd, true)
-			log.Trace("Accepted connection", "addr", fd.RemoteAddr())
-	
-			// Spawn the handler. It will give the slot back when the connection
-			// has been established.
-			go func() {
-				//看来只要连接建立完成之后。 槽位就会归还。 SetupConn这个函数我们记得再dialTask.Do里面也有调用， 这个函数主要是执行连接的几次握手。
-				srv.SetupConn(fd, inboundConn, nil)
+				time.Sleep(time.Millisecond * 200)
+				continue
+			} else if err != nil {
+				srv.log.Debug("Read error", "err", err)
 				slots <- struct{}{}
-			}()
+				return
+			}
+			break
 		}
-	}
 
+		remoteIP := netutil.AddrIP(fd.RemoteAddr())
+		if err := srv.checkInboundConn(remoteIP); err != nil {
+			srv.log.Debug("Rejected inbound connection", "addr", fd.RemoteAddr(), "err", err)
+			fd.Close()
+			slots <- struct{}{}
+			continue
+		}
+		if remoteIP != nil {
+			var addr *net.TCPAddr
+			if tcp, ok := fd.RemoteAddr().(*net.TCPAddr); ok {
+				addr = tcp
+			}
+			fd = newMeteredConn(fd, true, addr)
+			srv.log.Trace("Accepted connection", "addr", fd.RemoteAddr())
+		}
+		go func() {
+			///看来只要连接建立完成之后。 槽位就会归还。 SetupConn这个函数我们记得再dialTask.Do里面也有调用， 这个函数主要是执行连接的几次握手。
+			srv.SetupConn(fd, inboundConn, nil)
+			slots <- struct{}{}
+		}()
+	}
+}
+
+```
 SetupConn,这个函数执行握手协议，并尝试把连接创建位一个peer对象。
-
-
-	// SetupConn runs the handshakes and attempts to add the connection
-	// as a peer. It returns when the connection has been added as a peer
-	// or the handshakes have failed.
-	func (srv *Server) SetupConn(fd net.Conn, flags connFlag, dialDest *discover.Node) {
-		// Prevent leftover pending conns from entering the handshake.
-		srv.lock.Lock()
-		running := srv.running
-		srv.lock.Unlock()
-		//创建了一个conn对象。 newTransport指针实际上指向的newRLPx方法。 实际上是把fd用rlpx协议包装了一下。
-		c := &conn{fd: fd, transport: srv.newTransport(fd), flags: flags, cont: make(chan error)}
-		if !running {
-			c.close(errServerStopped)
-			return
-		}
-		// Run the encryption handshake.
-		var err error
-		//这里实际上执行的是rlpx.go里面的doEncHandshake.因为transport是conn的一个匿名字段。 匿名字段的方法会直接作为conn的一个方法。
-		if c.id, err = c.doEncHandshake(srv.PrivateKey, dialDest); err != nil {
-			log.Trace("Failed RLPx handshake", "addr", c.fd.RemoteAddr(), "conn", c.flags, "err", err)
-			c.close(err)
-			return
-		}
-		clog := log.New("id", c.id, "addr", c.fd.RemoteAddr(), "conn", c.flags)
-		// For dialed connections, check that the remote public key matches.
-		// 如果连接握手的ID和对应的ID不匹配
-		if dialDest != nil && c.id != dialDest.ID {
-			c.close(DiscUnexpectedIdentity)
-			clog.Trace("Dialed identity mismatch", "want", c, dialDest.ID)
-			return
-		}
-		// 这个checkpoint其实就是把第一个参数发送给第二个参数指定的队列。然后从c.cout接收返回信息。 是一个同步的方法。
-		//至于这里，后续的操作只是检查了一下连接是否合法就返回了。
-		if err := srv.checkpoint(c, srv.posthandshake); err != nil {
-			clog.Trace("Rejected peer before protocol handshake", "err", err)
-			c.close(err)
-			return
-		}
-		// Run the protocol handshake
-		phs, err := c.doProtoHandshake(srv.ourHandshake)
-		if err != nil {
-			clog.Trace("Failed proto handshake", "err", err)
-			c.close(err)
-			return
-		}
-		if phs.ID != c.id {
-			clog.Trace("Wrong devp2p handshake identity", "err", phs.ID)
-			c.close(DiscUnexpectedIdentity)
-			return
-		}
-		c.caps, c.name = phs.Caps, phs.Name
-		// 这里两次握手都已经完成了。 把c发送给addpeer队列。 后台处理这个队列的时候，会处理这个连接
-		if err := srv.checkpoint(c, srv.addpeer); err != nil {
-			clog.Trace("Rejected peer", "err", err)
-			c.close(err)
-			return
-		}
-		// If the checks completed successfully, runPeer has now been
-		// launched by run.
+```
+func (srv *Server) setupConn(c *conn, flags connFlag, dialDest *enode.Node) error {
+	// Prevent leftover pending conns from entering the handshake.
+	srv.lock.Lock()
+	running := srv.running
+	srv.lock.Unlock()
+	if !running {
+		return errServerStopped
 	}
 
+	// If dialing, figure out the remote public key.
+	if dialDest != nil {
+		dialPubkey := new(ecdsa.PublicKey)
+		if err := dialDest.Load((*enode.Secp256k1)(dialPubkey)); err != nil {
+			err = errors.New("dial destination doesn't have a secp256k1 public key")
+			srv.log.Trace("Setting up connection failed", "addr", c.fd.RemoteAddr(), "conn", c.flags, "err", err)
+			return err
+		}
+	}
+
+	// Run the RLPx handshake.
+	////这里实际上执行的是rlpx.go里面的doEncHandshake.因为transport是conn的一个匿名字段。 匿名字段的方法会直接作为conn的一个方法
+	remotePubkey, err := c.doEncHandshake(srv.PrivateKey)
+	if err != nil {
+		srv.log.Trace("Failed RLPx handshake", "addr", c.fd.RemoteAddr(), "conn", c.flags, "err", err)
+		return err
+	}
+	// 如果连接握手的ID和对应的ID不匹配
+	if dialDest != nil {
+		c.node = dialDest
+	} else {
+		c.node = nodeFromConn(remotePubkey, c.fd)
+	}
+	clog := srv.log.New("id", c.node.ID(), "addr", c.fd.RemoteAddr(), "conn", c.flags)
+	// 这个checkpoint其实就是把第一个参数发送给第二个参数指定的队列。然后从c.cout接收返回信息。 是一个同步的方法。
+	//至于这里，后续的操作只是检查了一下连接是否合法就返回了。
+	err = srv.checkpoint(c, srv.checkpointPostHandshake)
+	if err != nil {
+		clog.Trace("Rejected peer", "err", err)
+		return err
+	}
+
+	// Run the capability negotiation handshake.
+	phs, err := c.doProtoHandshake(srv.ourHandshake)
+	if err != nil {
+		clog.Trace("Failed p2p handshake", "err", err)
+		return err
+	}
+	if id := c.node.ID(); !bytes.Equal(crypto.Keccak256(phs.ID), id[:]) {
+		clog.Trace("Wrong devp2p handshake identity", "phsid", hex.EncodeToString(phs.ID))
+		return DiscUnexpectedIdentity
+	}
+	c.caps, c.name = phs.Caps, phs.Name
+	// 这里两次握手都已经完成了。 把c发送给checkpointAddPeer队列。 后台处理这个队列的时候，会处理这个连接
+	err = srv.checkpoint(c, srv.checkpointAddPeer)
+	if err != nil {
+		clog.Trace("Rejected peer", "err", err)
+		return err
+	}
+
+	return nil
+}
+```
 
 上面说到的流程是listenLoop的流程，listenLoop主要是用来接收外部主动连接者的。 还有部分情况是节点需要主动发起连接来连接外部节点的流程。  以及处理刚才上面的checkpoint队列信息的流程。这部分代码都在server.run这个goroutine里面。
 
