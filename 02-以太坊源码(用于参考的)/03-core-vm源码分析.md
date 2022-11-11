@@ -153,7 +153,7 @@ SetCode	，SetCallCode 设置代码。
 	// Context provides the EVM with auxiliary information. Once provided
 	// it shouldn't be modified.
 	// 上下文为EVM提供辅助信息。 一旦提供，不应该修改。
-	type Context struct {
+	type BlockContext struct {
 		// CanTransfer returns whether the account contains
 		// sufficient ether to transfer the value
 		// CanTransfer 函数返回账户是否有足够的ether用来转账
