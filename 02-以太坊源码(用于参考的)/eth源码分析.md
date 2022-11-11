@@ -1,5 +1,6 @@
 eth的源码又下面几个包
 
+- catalyst      主要催化剂实现了临时eth1 / eth2 RPC集成。
 - downloader 		主要用于和网络同步，包含了传统同步方式和快速同步方式
 - fetcher			主要用于基于块通知的同步，接收到当我们接收到NewBlockHashesMsg消息得时候，我们只收到了很多Block的hash值。 需要通过hash值来同步区块。
 - filter			提供基于RPC的过滤功能，包括实时数据的同步(PendingTx)，和历史的日志查询(Log filter)
